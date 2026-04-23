@@ -1,0 +1,10 @@
+.vscode/
+.venv/
+*__pycache__/
+dataset_test/
+dataset/
+backgrounds/*.jpg
+backgrounds/*.jpeg
+backgrounds/*.png
+backgrounds/*.webp
+
