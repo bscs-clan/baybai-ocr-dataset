@@ -10,7 +10,7 @@ import numpy as np
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 
 try:
@@ -32,6 +32,14 @@ NUM_SAMPLES     = 10_000
 
 TARGET_HEIGHT   = 64
 SVG_RENDER_SIZE = 256
+
+# Noto Sans Tagalog font (TTF) ------------------------------------------------
+NOTO_TAGALOG_FONT_PATH = "fonts/NotoSansTagalog-Regular.ttf"
+# Fraction of samples rendered with the TTF font instead of SVGs (0.0–1.0).
+# Set to 0.0 to use only SVGs; 1.0 to use only font.
+FONT_RENDER_PROB       = 0.50
+# Internal render height for font glyphs before scaling to TARGET_HEIGHT.
+FONT_RENDER_SCALE      = 4
 
 CHAR_SPACING_MIN  =  2
 CHAR_SPACING_MAX  = 10
@@ -360,6 +368,69 @@ def load_svg_character(
    img = img.resize((char_height, char_height), Image.LANCZOS)
    return img
 
+
+# ---------------------------------------------------------------------------
+# Font-based rendering (Noto Sans Tagalog TTF)
+# ---------------------------------------------------------------------------
+
+_font_cache: dict[int, ImageFont.FreeTypeFont] = {}
+
+def _get_font(size: int, font_path: str = NOTO_TAGALOG_FONT_PATH) -> ImageFont.FreeTypeFont:
+   """Return a cached FreeTypeFont at the requested pixel size."""
+   if size not in _font_cache:
+      _font_cache[size] = ImageFont.truetype(font_path, size)
+   return _font_cache[size]
+
+
+def render_word_image_font(
+   unicode_str: str,
+   target_height: int,
+   font_path: str = NOTO_TAGALOG_FONT_PATH,
+   render_scale: int = FONT_RENDER_SCALE,
+) -> Optional[Image.Image]:
+   """Render a Baybayin Unicode string with the Noto Sans Tagalog TTF font.
+
+   Renders at ``target_height * render_scale`` internally, then downscales
+   to ``target_height`` for crisp anti-aliasing, returning an RGBA image
+   with a transparent background and black glyphs.
+   """
+   if not unicode_str:
+      return None
+
+   render_h = target_height * render_scale
+   font = _get_font(render_h, font_path)
+
+   # Measure bounding box at render resolution
+   dummy = Image.new("RGBA", (1, 1))
+   draw  = ImageDraw.Draw(dummy)
+   bbox  = draw.textbbox((0, 0), unicode_str, font=font)
+   text_w = bbox[2] - bbox[0]
+   text_h = bbox[3] - bbox[1]
+
+   if text_w <= 0 or text_h <= 0:
+      return None
+
+   pad_x = int(CHAR_PADDING_X * render_scale)
+   pad_y = int(CHAR_PADDING_Y * render_scale)
+   canvas_w = text_w + 2 * pad_x
+   canvas_h = max(render_h, text_h) + 2 * pad_y
+
+   canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+   draw   = ImageDraw.Draw(canvas)
+
+   # Center vertically
+   x = pad_x - bbox[0]
+   y = pad_y + (max(render_h, text_h) - text_h) // 2 - bbox[1]
+   draw.text((x, y), unicode_str, font=font, fill=(0, 0, 0, 255))
+
+   # Downscale to target height, preserving aspect ratio
+   aspect  = canvas_w / canvas_h
+   out_h   = target_height + 2 * CHAR_PADDING_Y
+   out_w   = max(1, round(out_h * aspect))
+   canvas  = canvas.resize((out_w, out_h), Image.LANCZOS)
+
+   return canvas
+
 def render_word_image(
    folder_sequence: list[str],
    svg_library: dict[str, list[str]],
@@ -579,14 +650,16 @@ def save_sample(
    return filename
 
 def generate_dataset(
-   num_samples: int    = NUM_SAMPLES,
-   target_height: int  = TARGET_HEIGHT,
-   baybayin_dir: str   = BAYBAYIN_DIR,
-   backgrounds_dir: str = BACKGROUNDS_DIR,
-   wordlist_file: str  = WORDLIST_FILE,
-   output_dir: str     = OUTPUT_DIR,
-   grayscale: bool     = GRAYSCALE_OUTPUT,
-   seed: Optional[int] = RANDOM_SEED,
+   num_samples: int      = NUM_SAMPLES,
+   target_height: int    = TARGET_HEIGHT,
+   baybayin_dir: str     = BAYBAYIN_DIR,
+   backgrounds_dir: str  = BACKGROUNDS_DIR,
+   wordlist_file: str    = WORDLIST_FILE,
+   output_dir: str       = OUTPUT_DIR,
+   grayscale: bool       = GRAYSCALE_OUTPUT,
+   seed: Optional[int]   = RANDOM_SEED,
+   font_prob: float      = FONT_RENDER_PROB,
+   font_path: str        = NOTO_TAGALOG_FONT_PATH,
 ) -> None:
    if seed is not None:
       random.seed(seed)
@@ -601,12 +674,29 @@ def generate_dataset(
    svg_lib  = build_svg_library(baybayin_dir)
    bg_paths = load_background_paths(backgrounds_dir)
 
+   # Validate font path when font rendering is enabled
+   use_font = font_prob > 0.0
+   if use_font:
+      font_path_obj = Path(font_path)
+      if not font_path_obj.is_file():
+         log.warning(
+            "Noto Sans Tagalog font not found at '%s'. "
+            "Font rendering disabled (font_prob forced to 0).",
+            font_path,
+         )
+         use_font  = False
+         font_prob = 0.0
+      else:
+         log.info("Font rendering enabled  (prob=%.0f%%)  font: %s", font_prob * 100, font_path)
+
    log.info("Pre-checking %d words for translatability …", len(words))
    valid: list[tuple[str, list[str], str]] = []
    for w in words:
       folders, ustr = transliterate_to_baybayin(w)
 
-      if folders and ustr and any(f in svg_lib for f in folders):
+      has_svg  = folders and ustr and any(f in svg_lib for f in folders)
+      has_font = use_font and bool(ustr)
+      if has_svg or has_font:
          valid.append((w, folders, ustr))
 
    if not valid:
@@ -624,8 +714,20 @@ def generate_dataset(
          word, folders, unicode_label = random.choice(valid)
 
          try:
+            # Choose rendering source: font or SVG
+            use_font_this_sample = (
+               use_font
+               and random.random() < font_prob
+               and bool(unicode_label)         # has a valid Unicode string
+            )
 
-            text_img = render_word_image(folders, svg_lib, target_height)
+            if use_font_this_sample:
+               text_img = render_word_image_font(
+                  unicode_label, target_height, font_path=font_path
+               )
+            else:
+               text_img = render_word_image(folders, svg_lib, target_height)
+
             if text_img is None:
                failures += 1
                continue
@@ -722,6 +824,20 @@ def _build_parser() -> argparse.ArgumentParser:
       help="Random seed for reproducible generation (default: random)",
    )
    p.add_argument(
+      "--font-prob",
+      type=float, default=FONT_RENDER_PROB, metavar="PROB",
+      help=(
+         f"Probability [0.0–1.0] of rendering each sample with the Noto Sans "
+         f"Tagalog TTF font instead of SVGs (default: {FONT_RENDER_PROB}). "
+         "Set to 0 to use only SVGs, 1 to use only the font."
+      ),
+   )
+   p.add_argument(
+      "--font-path",
+      type=str, default=NOTO_TAGALOG_FONT_PATH, metavar="PATH",
+      help=f"Path to the Noto Sans Tagalog TTF font file (default: '{NOTO_TAGALOG_FONT_PATH}')",
+   )
+   p.add_argument(
       "--verbose", "-v",
       action="store_true",
       help="Enable DEBUG-level logging",
@@ -751,6 +867,8 @@ def main() -> None:
       output_dir      = args.output_dir,
       grayscale       = args.grayscale,
       seed            = args.seed,
+      font_prob       = args.font_prob,
+      font_path       = args.font_path,
    )
 
 if __name__ == "__main__":
