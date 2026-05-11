@@ -6,20 +6,12 @@ import random
 import logging
 import argparse
 import numpy as np
-
+import cairosvg
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
-
-try:
-   import cairosvg
-except ImportError:
-   sys.exit(
-      "[ERROR] cairosvg is not installed.\n"
-      "        Run:  pip install cairosvg\n"
-   )
 
 BAYBAYIN_DIR    = "baybayin"
 BACKGROUNDS_DIR = "backgrounds"
@@ -28,32 +20,28 @@ OUTPUT_DIR      = "dataset"
 IMAGES_SUBDIR   = "images"
 LABELS_FILE     = "labels.txt"
 
-NUM_SAMPLES     = 10_000
+NUM_SAMPLES     = 6_000
 
-TARGET_HEIGHT   = 64
+TARGET_HEIGHT   = 48
 SVG_RENDER_SIZE = 256
 
-# Noto Sans Tagalog font (TTF) ------------------------------------------------
 NOTO_TAGALOG_FONT_PATH = "fonts/NotoSansTagalog-Regular.ttf"
-# Fraction of samples rendered with the TTF font instead of SVGs (0.0–1.0).
-# Set to 0.0 to use only SVGs; 1.0 to use only font.
-FONT_RENDER_PROB       = 0.50
-# Internal render height for font glyphs before scaling to TARGET_HEIGHT.
+FONT_RENDER_PROB       = 0.5
 FONT_RENDER_SCALE      = 4
 
-CHAR_SPACING_MIN  =  2
+CHAR_SPACING_MIN  = 2
 CHAR_SPACING_MAX  = 10
-CHAR_PADDING_X    = 12
-CHAR_PADDING_Y    =  2
-CHAR_SCALE_MIN    = 0.8
+CHAR_PADDING_X    = 0
+CHAR_PADDING_Y    = 0
+CHAR_SCALE_MIN    = 0.9
 CHAR_SCALE_MAX    = 1
 
 SVG_STROKE_NOMINAL = 32
 SVG_STROKE_JITTER  =  8
 
-ROTATION_RANGE     = (-3,  3)
-BLUR_SIGMA_RANGE   = (0,   0.5)
-NOISE_STD_RANGE    = (0,      14)
+ROTATION_RANGE     = (-3, 3)
+BLUR_SIGMA_RANGE   = (0, 0.5)
+NOISE_STD_RANGE    = (0, 14)
 SCALE_DISTORT_PROB = 0.40
 SCALE_DISTORT_X    = (0.90, 1.10)
 SCALE_DISTORT_Y    = (0.90, 1.10)
@@ -61,11 +49,12 @@ AUGMENT_PROB       = 0.85
 
 BG_JITTER_FRAC  = 0.04
 ALPHA_MIN       = 0.85
-ALPHA_MAX       = 1.00
+ALPHA_MAX       = 1
 
 GRAYSCALE_OUTPUT = True
 
 RANDOM_SEED = None
+
 
 logging.basicConfig(
    level=logging.INFO,
