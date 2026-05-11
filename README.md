@@ -9,19 +9,34 @@ Generates a synthetic dataset of Baybayin characters and text images for trainin
 
 ## Getting Started
 
-1. Install the dependencies:
+1. Create a virtual environment:
 
-```bash
-pip install -r requirements.txt
-```
+   ```bash
+   python3 -m venv .venv
+   ```
 
-2. Put all your background textures inside the `backgrounds` folder.
+2. Activate the virtual environment:
 
-3. Generate the dataset:
+   ```bash
+   # On Windows
+   .venv\Scripts\activate
+   # On Unix or MacOS
+   source .venv/bin/activate
+   ```
 
-```bash
-python3 src/generate.py --num-samples 1000 --height 48
-```
+3. Install the dependencies:
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. Put all your background textures inside the `backgrounds` folder.
+
+5. Generate the dataset:
+
+   ```bash
+   python3 src/generate.py --num-samples 1000 --height 48
+   ```
 
 ### Options
 
