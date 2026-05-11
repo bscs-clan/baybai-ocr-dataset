@@ -6,8 +6,8 @@ import random
 import logging
 import argparse
 import numpy as np
-import cairosvg
 from io import BytesIO
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
@@ -24,6 +24,11 @@ NUM_SAMPLES     = 6_000
 
 TARGET_HEIGHT   = 48
 SVG_RENDER_SIZE = 256
+SVG_RENDER_CACHE_SIZE = 8192
+SVG_STROKE_CACHE_STEP = 4
+BACKGROUND_CACHE_SIZE = 32
+FONT_WORD_CACHE_SIZE  = 8192
+PROGRESS_UPDATES      = 100
 
 NOTO_TAGALOG_FONT_PATH = "fonts/NotoSansTagalog-Regular.ttf"
 FONT_RENDER_PROB       = 0.5
@@ -144,7 +149,9 @@ FOLDER_TO_UNICODE: dict[str, str] = {
    "h":        "\u1711\u1714",
 }
 
-_TAGALOG_VALID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz")
+_CONSONANTS = frozenset("bdghklmnprstwy")
+_VOWELS     = frozenset("aeiou")
+_TAGALOG_VALID_CHARS = _CONSONANTS | _VOWELS
 
 WORD_MIN_LEN = 2
 WORD_MAX_LEN = 24
@@ -198,10 +205,6 @@ def load_wordlist(filepath: str) -> list[str]:
       len(unique), filepath, skipped,
    )
    return unique
-
-_CONSONANTS = frozenset("bdghklmnprstwy")
-
-_VOWELS     = frozenset("aeiou")
 
 def _get_folder(consonant: Optional[str], vowel: Optional[str]) -> Optional[str]:
    if consonant is None:
@@ -274,7 +277,7 @@ def transliterate_to_baybayin(word: str) -> tuple[list[str], str]:
          i += 1
          continue
 
-      i += 1
+      return [], ""
 
    unicode_str = "".join(FOLDER_TO_UNICODE[f] for f in folders)
    return folders, unicode_str
@@ -333,16 +336,48 @@ def _make_white_transparent(img: Image.Image, threshold: int = 220) -> Image.Ima
    arr[:, :, 3] = np.where(white_mask, 0, a)
    return Image.fromarray(arr, "RGBA")
 
-def load_svg_character(
+_cairosvg_module = None
+
+
+def _get_cairosvg():
+   global _cairosvg_module
+   if _cairosvg_module is not None:
+      return _cairosvg_module
+
+   try:
+      import cairosvg
+   except (ImportError, OSError) as exc:
+      raise RuntimeError(
+         "SVG rendering requires cairosvg plus the native Cairo library. "
+         "Install Cairo/GTK for Windows, or run with --font-prob 1 to render with the bundled font only."
+      ) from exc
+
+   _cairosvg_module = cairosvg
+   return _cairosvg_module
+
+
+def _svg_rendering_available() -> bool:
+   try:
+      _get_cairosvg()
+   except RuntimeError:
+      return False
+   return True
+
+
+@lru_cache(maxsize=SVG_RENDER_CACHE_SIZE)
+def _read_svg_text(svg_path: str) -> str:
+   return Path(svg_path).read_text(encoding="utf-8")
+
+
+@lru_cache(maxsize=SVG_RENDER_CACHE_SIZE)
+def _load_svg_character_cached(
    svg_path: str,
    char_height: int,
-   stroke_width: float = SVG_STROKE_NOMINAL,
+   stroke_width: int,
 ) -> Image.Image:
-   with open(svg_path, "r", encoding="utf-8") as fh:
-      svg_text = fh.read()
+   svg_text = _patch_svg(_read_svg_text(svg_path), stroke_width)
 
-   svg_text = _patch_svg(svg_text, stroke_width)
-
+   cairosvg = _get_cairosvg()
    png_bytes = cairosvg.svg2png(
       bytestring=svg_text.encode("utf-8"),
       output_width=SVG_RENDER_SIZE,
@@ -351,38 +386,44 @@ def load_svg_character(
    )
 
    img = Image.open(BytesIO(png_bytes)).convert("RGBA")
-
    img = _make_white_transparent(img, threshold=220)
+   return img.resize((char_height, char_height), Image.LANCZOS)
 
-   img = img.resize((char_height, char_height), Image.LANCZOS)
-   return img
+
+def load_svg_character(
+   svg_path: str,
+   char_height: int,
+   stroke_width: float = SVG_STROKE_NOMINAL,
+) -> Image.Image:
+   stroke_width = max(
+      12,
+      round(stroke_width / SVG_STROKE_CACHE_STEP) * SVG_STROKE_CACHE_STEP,
+   )
+   img = _load_svg_character_cached(svg_path, char_height, stroke_width)
+   return img.copy()
 
 
 # ---------------------------------------------------------------------------
 # Font-based rendering (Noto Sans Tagalog TTF)
 # ---------------------------------------------------------------------------
 
-_font_cache: dict[int, ImageFont.FreeTypeFont] = {}
+_font_cache: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
 
 def _get_font(size: int, font_path: str = NOTO_TAGALOG_FONT_PATH) -> ImageFont.FreeTypeFont:
    """Return a cached FreeTypeFont at the requested pixel size."""
-   if size not in _font_cache:
-      _font_cache[size] = ImageFont.truetype(font_path, size)
-   return _font_cache[size]
+   cache_key = (font_path, size)
+   if cache_key not in _font_cache:
+      _font_cache[cache_key] = ImageFont.truetype(font_path, size)
+   return _font_cache[cache_key]
 
 
-def render_word_image_font(
+@lru_cache(maxsize=FONT_WORD_CACHE_SIZE)
+def _render_word_image_font_cached(
    unicode_str: str,
    target_height: int,
-   font_path: str = NOTO_TAGALOG_FONT_PATH,
-   render_scale: int = FONT_RENDER_SCALE,
+   font_path: str,
+   render_scale: int,
 ) -> Optional[Image.Image]:
-   """Render a Baybayin Unicode string with the Noto Sans Tagalog TTF font.
-
-   Renders at ``target_height * render_scale`` internally, then downscales
-   to ``target_height`` for crisp anti-aliasing, returning an RGBA image
-   with a transparent background and black glyphs.
-   """
    if not unicode_str:
       return None
 
@@ -419,6 +460,22 @@ def render_word_image_font(
    canvas  = canvas.resize((out_w, out_h), Image.LANCZOS)
 
    return canvas
+
+
+def render_word_image_font(
+   unicode_str: str,
+   target_height: int,
+   font_path: str = NOTO_TAGALOG_FONT_PATH,
+   render_scale: int = FONT_RENDER_SCALE,
+) -> Optional[Image.Image]:
+   """Render a Baybayin Unicode string with the Noto Sans Tagalog TTF font.
+
+   Renders at ``target_height * render_scale`` internally, then downscales
+   to ``target_height`` for crisp anti-aliasing, returning an RGBA image
+   with a transparent background and black glyphs.
+   """
+   img = _render_word_image_font_cached(unicode_str, target_height, font_path, render_scale)
+   return img.copy() if img is not None else None
 
 def render_word_image(
    folder_sequence: list[str],
@@ -489,8 +546,8 @@ def _pad_or_crop_to(img: Image.Image, w: int, h: int) -> Image.Image:
    canvas.paste(img, (x, y), mask=img)
    return canvas
 
-def apply_augmentation(img: Image.Image) -> Image.Image:
-   if random.random() > AUGMENT_PROB:
+def apply_augmentation(img: Image.Image, augment_prob: float = AUGMENT_PROB) -> Image.Image:
+   if random.random() > augment_prob:
       return img
 
    orig_w, orig_h = img.size
@@ -553,13 +610,19 @@ def load_background_paths(backgrounds_dir: str) -> list[str]:
    log.info("Found %d background image(s) in '%s'", len(paths), backgrounds_dir)
    return [str(p) for p in paths]
 
+
+@lru_cache(maxsize=BACKGROUND_CACHE_SIZE)
+def _load_background_image(bg_path: str) -> Image.Image:
+   return Image.open(bg_path).convert("RGB")
+
+
 def compose_with_background(
    text_img: Image.Image,
    bg_paths: list[str],
    target_height: int,
 ) -> Image.Image:
 
-   bg = Image.open(random.choice(bg_paths)).convert("RGB")
+   bg = _load_background_image(random.choice(bg_paths))
 
    tw, th = text_img.size
    
@@ -649,10 +712,14 @@ def generate_dataset(
    seed: Optional[int]   = RANDOM_SEED,
    font_prob: float      = FONT_RENDER_PROB,
    font_path: str        = NOTO_TAGALOG_FONT_PATH,
+   augment_prob: float   = AUGMENT_PROB,
 ) -> None:
    if seed is not None:
       random.seed(seed)
       np.random.seed(seed)
+
+   font_prob = min(1.0, max(0.0, font_prob))
+   augment_prob = min(1.0, max(0.0, augment_prob))
 
    out_root   = Path(output_dir)
    images_dir = out_root / IMAGES_SUBDIR
@@ -678,12 +745,29 @@ def generate_dataset(
       else:
          log.info("Font rendering enabled  (prob=%.0f%%)  font: %s", font_prob * 100, font_path)
 
+   log.info("Augmentation enabled  (prob=%.0f%%)", augment_prob * 100)
+
+   svg_enabled = font_prob < 1.0
+   if svg_enabled and not _svg_rendering_available():
+      if use_font:
+         log.warning(
+            "CairoSVG/native Cairo is unavailable. SVG rendering disabled; "
+            "forcing font-only generation."
+         )
+         font_prob = 1.0
+         svg_enabled = False
+      else:
+         raise RuntimeError(
+            "SVG rendering requires cairosvg plus the native Cairo library, "
+            "and font rendering is disabled."
+         )
+
    log.info("Pre-checking %d words for translatability …", len(words))
    valid: list[tuple[str, list[str], str]] = []
    for w in words:
       folders, ustr = transliterate_to_baybayin(w)
 
-      has_svg  = folders and ustr and any(f in svg_lib for f in folders)
+      has_svg  = svg_enabled and folders and ustr and all(f in svg_lib for f in folders)
       has_font = use_font and bool(ustr)
       if has_svg or has_font:
          valid.append((w, folders, ustr))
@@ -697,6 +781,7 @@ def generate_dataset(
 
    failures = 0
    generated = 0
+   progress_interval = max(1, num_samples // PROGRESS_UPDATES)
 
    with open(labels_path, "w", encoding="utf-8") as labels_fh:
       while generated < num_samples:
@@ -704,10 +789,11 @@ def generate_dataset(
 
          try:
             # Choose rendering source: font or SVG
+            has_svg = svg_enabled and all(f in svg_lib for f in folders)
             use_font_this_sample = (
                use_font
-               and random.random() < font_prob
                and bool(unicode_label)         # has a valid Unicode string
+               and (not has_svg or random.random() < font_prob)
             )
 
             if use_font_this_sample:
@@ -721,7 +807,7 @@ def generate_dataset(
                failures += 1
                continue
 
-            text_img = apply_augmentation(text_img)
+            text_img = apply_augmentation(text_img, augment_prob=augment_prob)
 
             final_img = compose_with_background(text_img, bg_paths, target_height)
 
@@ -736,11 +822,12 @@ def generate_dataset(
 
             generated += 1
 
-            percent = 100 * (generated / num_samples)
-            filled = int(50 * generated // num_samples)
-            bar = '█' * filled + '-' * (50 - filled)
-            sys.stdout.write(f'\rGenerating |{bar}| {percent:.1f}%')
-            sys.stdout.flush()
+            if generated == 1 or generated == num_samples or generated % progress_interval == 0:
+               percent = 100 * (generated / num_samples)
+               filled = int(50 * generated // num_samples)
+               bar = "#" * filled + "-" * (50 - filled)
+               sys.stdout.write(f"\rGenerating |{bar}| {percent:.1f}%")
+               sys.stdout.flush()
 
          except Exception as exc:
             failures += 1
@@ -816,7 +903,7 @@ def _build_parser() -> argparse.ArgumentParser:
       "--font-prob",
       type=float, default=FONT_RENDER_PROB, metavar="PROB",
       help=(
-         f"Probability [0.0–1.0] of rendering each sample with the Noto Sans "
+         f"Probability [0.0-1.0] of rendering each sample with the Noto Sans "
          f"Tagalog TTF font instead of SVGs (default: {FONT_RENDER_PROB}). "
          "Set to 0 to use only SVGs, 1 to use only the font."
       ),
@@ -825,6 +912,16 @@ def _build_parser() -> argparse.ArgumentParser:
       "--font-path",
       type=str, default=NOTO_TAGALOG_FONT_PATH, metavar="PATH",
       help=f"Path to the Noto Sans Tagalog TTF font file (default: '{NOTO_TAGALOG_FONT_PATH}')",
+   )
+   p.add_argument(
+      "--augment-prob",
+      type=float, default=AUGMENT_PROB, metavar="PROB",
+      help=f"Probability [0.0-1.0] of applying augmentation (default: {AUGMENT_PROB}).",
+   )
+   p.add_argument(
+      "--no-augment",
+      dest="augment_prob", action="store_const", const=0.0,
+      help="Disable augmentation for faster generation.",
    )
    p.add_argument(
       "--verbose", "-v",
@@ -858,6 +955,7 @@ def main() -> None:
       seed            = args.seed,
       font_prob       = args.font_prob,
       font_path       = args.font_path,
+      augment_prob    = args.augment_prob,
    )
 
 if __name__ == "__main__":
