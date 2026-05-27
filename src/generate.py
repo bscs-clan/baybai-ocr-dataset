@@ -31,8 +31,10 @@ FONT_WORD_CACHE_SIZE  = 8192
 PROGRESS_UPDATES      = 100
 
 NOTO_TAGALOG_FONT_PATH = "fonts/NotoSansTagalog-Regular.ttf"
-FONT_RENDER_PROB       = 0.5
+FONT_RENDER_PROB       = 0.30
 FONT_RENDER_SCALE      = 4
+
+PLAIN_BACKGROUND_PROB = 0.30
 
 CHAR_SPACING_MIN  = 2
 CHAR_SPACING_MAX  = 10
@@ -51,6 +53,13 @@ SCALE_DISTORT_PROB = 0.40
 SCALE_DISTORT_X    = (0.90, 1.10)
 SCALE_DISTORT_Y    = (0.90, 1.10)
 AUGMENT_PROB       = 0.85
+
+# Quality gating defaults (for readability at small heights like 48px)
+# If a sample is too low-quality, it will be rejected and another one generated.
+QUALITY_MIN_FOREGROUND_RATIO = 0.010
+QUALITY_MAX_COMPONENTS       = 120
+QUALITY_MIN_LAPLACIAN_VAR     = 6.0
+QUALITY_MIN_CONTRAST_MARGIN   = 18.0
 
 BG_JITTER_FRAC  = 0.04
 ALPHA_MIN       = 0.85
@@ -546,40 +555,62 @@ def _pad_or_crop_to(img: Image.Image, w: int, h: int) -> Image.Image:
    canvas.paste(img, (x, y), mask=img)
    return canvas
 
-def apply_augmentation(img: Image.Image, augment_prob: float = AUGMENT_PROB) -> Image.Image:
+def apply_augmentation(
+   img: Image.Image,
+   augment_prob: float = AUGMENT_PROB,
+   *,
+   safe_small_height: bool = False,
+) -> Image.Image:
    if random.random() > augment_prob:
       return img
 
-   orig_w, orig_h = img.size
+   # If training is at a very small height (48px), aggressively distorted
+   # / noisy / blurry samples tend to become unreadable. Apply tighter caps.
+   if safe_small_height:
+      rot_range = (-2, 2)
+      blur_sigma_range = (0, 0.30)
+      noise_std_range = (0, 7)
+      scale_distort_prob = 0.22
+      scale_distort_x = (0.94, 1.06)
+      scale_distort_y = (0.94, 1.06)
+      alpha_noise = (0.5, 0.9)
+   else:
+      rot_range = ROTATION_RANGE
+      blur_sigma_range = BLUR_SIGMA_RANGE
+      noise_std_range = NOISE_STD_RANGE
+      scale_distort_prob = SCALE_DISTORT_PROB
+      scale_distort_x = SCALE_DISTORT_X
+      scale_distort_y = SCALE_DISTORT_Y
+      alpha_noise = (0.5, 1.2)
 
-   angle = random.uniform(*ROTATION_RANGE)
+   angle = random.uniform(*rot_range)
    img = img.rotate(angle, resample=Image.BICUBIC, expand=True)
 
-   if random.random() < 0.6:
-      blur_radius = random.uniform(0.5, 1.2)
+   if random.random() < 0.55:
+      blur_radius = random.uniform(*alpha_noise)
       blurred = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
       arr = np.array(blurred, dtype=np.float32)
-      
+
       h, w = arr.shape[:2]
       grid_h, grid_w = max(2, h // 8), max(2, w // 8)
       small_noise = np.random.uniform(90, 160, (grid_h, grid_w)).astype(np.float32)
       noise_img = Image.fromarray(small_noise).resize((w, h), Image.BICUBIC)
       thresh = np.array(noise_img, dtype=np.float32)
-      
+
       alpha = arr[:, :, 3]
       new_alpha = np.clip((alpha - thresh) * 5.0 + 128, 0, 255)
-      
+
       arr[:, :, 3] = new_alpha
       arr = arr.astype(np.uint8)
       img = Image.fromarray(arr, "RGBA")
 
-   sigma = random.uniform(*BLUR_SIGMA_RANGE)
+   sigma = random.uniform(*blur_sigma_range)
    if sigma > 0.25:
       img = img.filter(ImageFilter.GaussianBlur(radius=sigma))
 
-   noise_std = random.uniform(*NOISE_STD_RANGE)
+   noise_std = random.uniform(*noise_std_range)
    if noise_std > 1.0:
-      arr  = np.array(img, dtype=np.float32)
+      arr = np.array(img, dtype=np.float32)
       alpha_norm = arr[:, :, 3] / 255.0
       noise = np.random.normal(0.0, noise_std, arr.shape[:2])
       for c in range(3):
@@ -587,9 +618,9 @@ def apply_augmentation(img: Image.Image, augment_prob: float = AUGMENT_PROB) -> 
       arr = np.clip(arr, 0, 255).astype(np.uint8)
       img = Image.fromarray(arr, "RGBA")
 
-   if random.random() < SCALE_DISTORT_PROB:
-      sx = random.uniform(*SCALE_DISTORT_X)
-      sy = random.uniform(*SCALE_DISTORT_Y)
+   if random.random() < scale_distort_prob:
+      sx = random.uniform(*scale_distort_x)
+      sy = random.uniform(*scale_distort_y)
       new_w = max(8, int(img.width * sx))
       new_h = max(8, int(img.height * sy))
       img = img.resize((new_w, new_h), Image.LANCZOS)
@@ -616,72 +647,306 @@ def _load_background_image(bg_path: str) -> Image.Image:
    return Image.open(bg_path).convert("RGB")
 
 
+def _rgb_to_gray_arr(img: Image.Image) -> np.ndarray:
+   if img.mode != "RGB":
+      img = img.convert("RGB")
+   arr = np.array(img, dtype=np.float32)
+   lum = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+   return lum
+
+
+def _estimate_contrast_from_background(bg_patch: Image.Image) -> tuple[float, float]:
+   """Return mean_lum and std_lum of a background patch."""
+   lum = _rgb_to_gray_arr(bg_patch)
+   return float(np.mean(lum)), float(np.std(lum))
+
+
+def _choose_text_color_rgba_from_background(bg_patch: Image.Image, text_img: Image.Image) -> Image.Image:
+   """
+   Convert the RGBA glyph layer to either pure black or pure white
+   using background contrast estimation.
+   """
+   bg_mean, bg_std = _estimate_contrast_from_background(bg_patch)
+
+   # "Contrast" proxy for OCR: how far foreground luminance deviates from background mean.
+   # Try both and pick the higher absolute difference.
+   # (bg_std affects readability but we keep this simple and robust.)
+   contrast_black = abs(bg_mean - 0.0)
+   contrast_white = abs(bg_mean - 255.0)
+
+   arr = np.array(text_img, dtype=np.float32).copy()
+   if contrast_white >= contrast_black:
+      arr[:, :, 0] = 255
+      arr[:, :, 1] = 255
+      arr[:, :, 2] = 255
+   else:
+      arr[:, :, 0] = 0
+      arr[:, :, 1] = 0
+      arr[:, :, 2] = 0
+
+   return Image.fromarray(arr.astype(np.uint8), "RGBA")
+
+
 def compose_with_background(
    text_img: Image.Image,
    bg_paths: list[str],
    target_height: int,
 ) -> Image.Image:
 
-   bg = _load_background_image(random.choice(bg_paths))
-
    tw, th = text_img.size
-   
+
    max_jitter_x = int(tw * BG_JITTER_FRAC)
    max_jitter_y = int(th * BG_JITTER_FRAC)
-   
+
    patch_w = tw + 2 * max_jitter_x
    patch_h = th + 2 * max_jitter_y
 
-   if bg.width < patch_w or bg.height < patch_h:
-      scale = max(patch_w / bg.width, patch_h / bg.height) * 1.05
-      bg = bg.resize(
-         (math.ceil(bg.width * scale), math.ceil(bg.height * scale)),
-         Image.LANCZOS,
+   # Probability of using plain background
+   PLAIN_BACKGROUND_PROB = 0.30
+   # 30% plain colors
+   # 70% texture images
+
+   use_plain = random.random() < PLAIN_BACKGROUND_PROB
+
+   # ----------------------------
+   # CREATE BACKGROUND
+   # ----------------------------
+
+   if use_plain:
+
+      # White / Black / Random Color choices
+      mode = random.choice([
+         "white",
+         "black",
+         "random"
+      ])
+
+      if mode == "white":
+         bg_color = (255,255,255)
+
+      elif mode == "black":
+         bg_color = (0,0,0)
+
+      else:
+         bg_color = (
+            random.randint(0,255),
+            random.randint(0,255),
+            random.randint(0,255)
+         )
+
+      bg_patch = Image.new(
+         "RGB",
+         (patch_w, patch_h),
+         bg_color
       )
 
-   max_x = max(0, bg.width  - patch_w)
-   max_y = max(0, bg.height - patch_h)
-   cx = random.randint(0, max_x)
-   cy = random.randint(0, max_y)
-   bg_patch = bg.crop((cx, cy, cx + patch_w, cy + patch_h))
+   else:
 
-   jitter_x = int(max_jitter_x * random.uniform(-1, 1))
-   jitter_y = int(max_jitter_y * random.uniform(-1, 1))
+      bg = _load_background_image(
+         random.choice(bg_paths)
+      )
+
+      if bg.width < patch_w or bg.height < patch_h:
+         scale = max(
+            patch_w / bg.width,
+            patch_h / bg.height
+         ) * 1.05
+
+         bg = bg.resize(
+            (
+               math.ceil(bg.width * scale),
+               math.ceil(bg.height * scale)
+            ),
+            Image.LANCZOS
+         )
+
+      max_x = max(0, bg.width - patch_w)
+      max_y = max(0, bg.height - patch_h)
+
+      cx = random.randint(0, max_x)
+      cy = random.randint(0, max_y)
+
+      bg_patch = bg.crop(
+         (
+            cx,
+            cy,
+            cx + patch_w,
+            cy + patch_h
+         )
+      )
+
+   # ----------------------------
+   # TEXT PLACEMENT
+   # ----------------------------
+
+   jitter_x = int(
+      max_jitter_x * random.uniform(-1,1)
+   )
+
+   jitter_y = int(
+      max_jitter_y * random.uniform(-1,1)
+   )
 
    paste_x = max_jitter_x + jitter_x
    paste_y = max_jitter_y + jitter_y
 
-   bg_arr = np.array(bg_patch, dtype=np.float32)
-   luminance = 0.299 * bg_arr[:, :, 0] + 0.587 * bg_arr[:, :, 1] + 0.114 * bg_arr[:, :, 2]
-   avg_lum = np.mean(luminance)
+   opacity = random.uniform(
+      ALPHA_MIN,
+      ALPHA_MAX
+   )
 
-   opacity = random.uniform(ALPHA_MIN, ALPHA_MAX)
-   
+   text_layer = _choose_text_color_rgba_from_background(
+      bg_patch,
+      text_img
+   )
 
-   arr = np.array(text_img, dtype=np.float32).copy()
-
-
-   if avg_lum < 110:
-
-      arr[:, :, 0] = 255
-      arr[:, :, 1] = 255
-      arr[:, :, 2] = 255
-      
    if opacity < 0.999:
-      arr[:, :, 3] = arr[:, :, 3] * opacity
-      
-   text_layer = Image.fromarray(arr.astype(np.uint8), "RGBA")
+
+      arr = np.array(
+         text_layer,
+         dtype=np.float32
+      )
+
+      arr[:,:,3] *= opacity
+
+      text_layer = Image.fromarray(
+         arr.astype(np.uint8),
+         "RGBA"
+      )
 
    composite = bg_patch.convert("RGBA")
-   composite.paste(text_layer, (paste_x, paste_y), mask=text_layer)
+
+   composite.paste(
+      text_layer,
+      (paste_x, paste_y),
+      mask=text_layer
+   )
+
    composite = composite.convert("RGB")
 
    aspect = tw / th
-   out_h  = target_height
-   out_w  = max(1, round(out_h * aspect))
-   composite = composite.resize((out_w, out_h), Image.LANCZOS)
+
+   out_h = target_height
+   out_w = max(
+      1,
+      round(out_h * aspect)
+   )
+
+   composite = composite.resize(
+      (out_w, out_h),
+      Image.LANCZOS
+   )
 
    return composite
+
+def _count_connected_components(mask: np.ndarray) -> int:
+   """
+   Lightweight 4-connected components count for boolean mask.
+   mask: HxW bool
+   """
+   h, w = mask.shape
+   visited = np.zeros_like(mask, dtype=bool)
+
+   def neighbors(y: int, x: int):
+      if y > 0: yield y - 1, x
+      if y + 1 < h: yield y + 1, x
+      if x > 0: yield y, x - 1
+      if x + 1 < w: yield y, x + 1
+
+   components = 0
+   for y in range(h):
+      row = mask[y]
+      for x in range(w):
+         if not row[x] or visited[y, x]:
+            continue
+         components += 1
+         stack = [(y, x)]
+         visited[y, x] = True
+         while stack:
+            cy, cx = stack.pop()
+            for ny, nx in neighbors(cy, cx):
+               if mask[ny, nx] and not visited[ny, nx]:
+                  visited[ny, nx] = True
+                  stack.append((ny, nx))
+   return components
+
+
+def compute_sample_quality(img: Image.Image) -> dict[str, float]:
+   """
+   Heuristic quality scoring using foreground segmentation + sharpness + components.
+   """
+   gray = ImageOps.grayscale(img)
+   arr = np.array(gray, dtype=np.uint8)
+   h, w = arr.shape[:2]
+
+   # Foreground segmentation by thresholding away from background mid/mean.
+   # Use Otsu-like heuristic via mean and std: text is expected to differ from bg.
+   mean = float(np.mean(arr))
+   std = float(np.std(arr))
+   # Robust threshold: if text is dark -> below threshold, if bright -> above threshold.
+   t_low = mean - 0.35 * std
+   t_high = mean + 0.35 * std
+
+   fg_dark = arr < t_low
+   fg_bright = arr > t_high
+   fg = fg_dark | fg_bright
+
+   fg_ratio = float(np.mean(fg)) if h * w > 0 else 0.0
+
+   # Component count on downsampled mask to be stable at small sizes
+   small = Image.fromarray(fg.astype(np.uint8) * 255).resize(
+      (max(1, w // 2), max(1, h // 2)), Image.NEAREST
+   )
+   small_mask = np.array(small, dtype=np.uint8) > 0
+   components = float(_count_connected_components(small_mask)) if small_mask.size else 0.0
+
+   # Sharpness estimate using Laplacian variance
+   # (use simple discrete laplacian)
+   a = arr.astype(np.float32)
+   lap = (
+      -4.0 * a
+      + np.roll(a, 1, axis=0)
+      + np.roll(a, -1, axis=0)
+      + np.roll(a, 1, axis=1)
+      + np.roll(a, -1, axis=1)
+   )
+   lap_var = float(np.var(lap))
+
+   # Foreground/background contrast margin
+   if np.any(fg):
+      fg_mean = float(np.mean(arr[fg]))
+   else:
+      fg_mean = mean
+   bg_mask = ~fg
+   if np.any(bg_mask):
+      bg_mean = float(np.mean(arr[bg_mask]))
+   else:
+      bg_mean = mean
+   contrast_margin = abs(fg_mean - bg_mean)
+
+   return {
+      "fg_ratio": fg_ratio,
+      "components": components,
+      "lap_var": lap_var,
+      "contrast_margin": contrast_margin,
+   }
+
+
+def is_sample_quality_good(img: Image.Image) -> tuple[bool, dict[str, float]]:
+   q = compute_sample_quality(img)
+
+   ok = True
+   if q["fg_ratio"] < QUALITY_MIN_FOREGROUND_RATIO:
+      ok = False
+   if q["components"] > QUALITY_MAX_COMPONENTS:
+      ok = False
+   if q["lap_var"] < QUALITY_MIN_LAPLACIAN_VAR:
+      ok = False
+   if q["contrast_margin"] < QUALITY_MIN_CONTRAST_MARGIN:
+      ok = False
+
+   return ok, q
+
 
 def save_sample(
    img: Image.Image,
@@ -701,6 +966,7 @@ def save_sample(
 
    return filename
 
+
 def generate_dataset(
    num_samples: int      = NUM_SAMPLES,
    target_height: int    = TARGET_HEIGHT,
@@ -713,6 +979,7 @@ def generate_dataset(
    font_prob: float      = FONT_RENDER_PROB,
    font_path: str        = NOTO_TAGALOG_FONT_PATH,
    augment_prob: float   = AUGMENT_PROB,
+   workers: Optional[int] = None,
 ) -> None:
    if seed is not None:
       random.seed(seed)
@@ -782,12 +1049,31 @@ def generate_dataset(
    failures = 0
    generated = 0
    progress_interval = max(1, num_samples // PROGRESS_UPDATES)
+   safe_small_height = (target_height <= 48)
 
-   with open(labels_path, "w", encoding="utf-8") as labels_fh:
-      while generated < num_samples:
-         word, folders, unicode_label = random.choice(valid)
+   # Multi-threaded generation. To keep filenames/labels consistent, each worker
+   # generates until it finds a *single accepted* sample, then returns it.
+   # The main thread saves accepted samples in submission order.
+   import concurrent.futures
 
-         try:
+   if workers is None:
+      workers = max(1, (os.cpu_count() or 1))
+   workers = max(1, int(workers))
+
+   def _generate_one_until_ok(task_idx: int) -> tuple[int, Optional[tuple[Image.Image, str]]]:
+      try:
+         base_local = 0 if seed is None else (seed + 10_000_000 + task_idx)
+
+         # Try multiple times inside the worker to reduce wasted capacity.
+         # (Acceptance rate can be low due to quality gating.)
+         for attempt in range(200):
+            if seed is not None:
+               local_seed = base_local + attempt
+               random.seed(local_seed)
+               np.random.seed(local_seed % (2**32 - 1))
+
+            word, folders, unicode_label = random.choice(valid)
+
             # Choose rendering source: font or SVG
             has_svg = svg_enabled and all(f in svg_lib for f in folders)
             use_font_this_sample = (
@@ -804,40 +1090,98 @@ def generate_dataset(
                text_img = render_word_image(folders, svg_lib, target_height)
 
             if text_img is None:
-               failures += 1
                continue
 
-            text_img = apply_augmentation(text_img, augment_prob=augment_prob)
+            text_img = apply_augmentation(
+               text_img,
+               augment_prob=augment_prob,
+               safe_small_height=safe_small_height,
+            )
 
             final_img = compose_with_background(text_img, bg_paths, target_height)
 
-            save_sample(
-               final_img,
-               unicode_label,
-               generated + 1,
-               images_dir,
-               labels_fh,
-               grayscale=grayscale,
+            ok, _q = is_sample_quality_good(final_img)
+            if not ok:
+               continue
+
+            return task_idx, (final_img, unicode_label)
+
+         return task_idx, None
+
+      except Exception as exc:
+         log.warning("Worker generation failed (task_idx=%d): %s", task_idx, exc)
+         return task_idx, None
+
+   failures = 0
+   generated = 0
+   progress_interval = max(1, num_samples // PROGRESS_UPDATES)
+
+   with open(labels_path, "w", encoding="utf-8") as labels_fh:
+      with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+         futures: list[concurrent.futures.Future] = []
+         task_counter = 0
+
+         def _submit_one() -> None:
+            nonlocal task_counter
+            idx = task_counter
+            task_counter += 1
+            futures.append(ex.submit(_generate_one_until_ok, idx))
+
+         # Keep a sliding window of in-flight tasks.
+         in_flight_target = min(num_samples, workers * 4)
+         for _ in range(in_flight_target):
+            _submit_one()
+
+         # Save accepted samples in submission order by tracking the next task index.
+         accepted_buffer: dict[int, tuple[Image.Image, str]] = {}
+         next_to_save = 0
+
+         while generated < num_samples:
+            done, not_done = concurrent.futures.wait(
+               futures,
+               return_when=concurrent.futures.FIRST_COMPLETED,
             )
+            futures = list(not_done)
 
-            generated += 1
+            for fut in done:
+               result_task_idx, result = fut.result()
+               if result is None:
+                  failures += 1
+               else:
+                  accepted_buffer[result_task_idx] = result
 
-            if generated == 1 or generated == num_samples or generated % progress_interval == 0:
-               percent = 100 * (generated / num_samples)
-               filled = int(50 * generated // num_samples)
-               bar = "#" * filled + "-" * (50 - filled)
-               sys.stdout.write(f"\rGenerating |{bar}| {percent:.1f}%")
-               sys.stdout.flush()
+               # Attempt to flush in-order accepted results.
+               while next_to_save in accepted_buffer and generated < num_samples:
+                  final_img, unicode_label = accepted_buffer.pop(next_to_save)
+                  generated += 1
+                  save_sample(
+                     final_img,
+                     unicode_label,
+                     generated,
+                     images_dir,
+                     labels_fh,
+                     grayscale=grayscale,
+                  )
 
-         except Exception as exc:
-            failures += 1
-            log.warning("Sample failed (word='%s'): %s", word, exc)
+                  if generated == 1 or generated == num_samples or generated % progress_interval == 0:
+                     percent = 100 * (generated / num_samples)
+                     filled = int(50 * generated // num_samples)
+                     bar = "#" * filled + "-" * (50 - filled)
+                     sys.stdout.write(f"\rGenerating |{bar}| {percent:.1f}%")
+                     sys.stdout.flush()
 
-            if failures > max(50, num_samples * 0.15):
-               raise RuntimeError(
-                  f"Failure rate is too high ({failures} failures after "
-                  f"{generated} successes). Check your assets."
-               ) from exc
+                  next_to_save += 1
+
+               if failures > max(50, num_samples * 0.15):
+                  raise RuntimeError(
+                     f"Failure rate is too high ({failures} failures after "
+                     f"{generated} successes). Check your assets."
+                  )
+
+               # Maintain in-flight window.
+               while len(futures) < in_flight_target and generated + len(futures) < num_samples:
+                  _submit_one()
+
    print()
 
    log.info(
@@ -924,6 +1268,13 @@ def _build_parser() -> argparse.ArgumentParser:
       help="Disable augmentation for faster generation.",
    )
    p.add_argument(
+      "--workers",
+      type=int,
+      default=None,
+      metavar="N",
+      help="Number of worker threads for image generation (default: CPU count).",
+   )
+   p.add_argument(
       "--verbose", "-v",
       action="store_true",
       help="Enable DEBUG-level logging",
@@ -956,6 +1307,7 @@ def main() -> None:
       font_prob       = args.font_prob,
       font_path       = args.font_path,
       augment_prob    = args.augment_prob,
+      workers         = args.workers,
    )
 
 if __name__ == "__main__":
