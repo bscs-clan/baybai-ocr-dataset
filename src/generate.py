@@ -5,6 +5,7 @@ import math
 import random
 import logging
 import argparse
+import itertools
 import numpy as np
 from io import BytesIO
 from functools import lru_cache
@@ -15,7 +16,6 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 BAYBAYIN_DIR    = "baybayin"
 BACKGROUNDS_DIR = "backgrounds"
-WORDLIST_FILE   = "dictionaries/filipino-wordlist.txt"
 OUTPUT_DIR      = "dataset"
 IMAGES_SUBDIR   = "images"
 LABELS_FILE     = "labels.txt"
@@ -31,13 +31,13 @@ FONT_WORD_CACHE_SIZE  = 8192
 PROGRESS_UPDATES      = 100
 
 NOTO_TAGALOG_FONT_PATH = "fonts/NotoSansTagalog-Regular.ttf"
-FONT_RENDER_PROB       = 0.30
 FONT_RENDER_SCALE      = 4
+FONT_RENDER_PROB       = 0.30
 
 PLAIN_BACKGROUND_PROB = 0.30
 
-CHAR_SPACING_MIN  = 2
-CHAR_SPACING_MAX  = 10
+CHAR_SPACING_MIN  = 0
+CHAR_SPACING_MAX  = 2
 CHAR_PADDING_X    = 0
 CHAR_PADDING_Y    = 0
 CHAR_SCALE_MIN    = 0.9
@@ -160,60 +160,92 @@ FOLDER_TO_UNICODE: dict[str, str] = {
 
 _CONSONANTS = frozenset("bdghklmnprstwy")
 _VOWELS     = frozenset("aeiou")
-_TAGALOG_VALID_CHARS = _CONSONANTS | _VOWELS
 
-WORD_MIN_LEN = 2
-WORD_MAX_LEN = 24
+MAX_WORDS_PER_SAMPLE = 3
+MIN_SYLLABLES_PER_WORD = 2
+MAX_CHARACTERS_PER_WORD = 5
+MAX_SYLLABLES_PER_WORD = MAX_CHARACTERS_PER_WORD
+COMMA_LABEL = "\u1735"
+DOT_LABEL = "\u1736"
+BALANCED_CODEPOINTS = (
+   *(chr(codepoint) for codepoint in range(0x1700, 0x1715)),
+   COMMA_LABEL,
+   DOT_LABEL,
+)
+_BALANCE_CONSONANTS = tuple(sorted(_CONSONANTS)) + ("ng",)
 
-def _clean_word(raw: str) -> str:
-   word = raw.strip()
-   word = word.replace("\u00ad", "")
-   word = word.lower()
-   return word
-
-def _is_valid_tagalog_word(word: str) -> bool:
-   if not (WORD_MIN_LEN <= len(word) <= WORD_MAX_LEN):
-      return False
-   if "-" in word or "'" in word or "\'" in word:
-      return False
-
-   return all(c in _TAGALOG_VALID_CHARS for c in word)
-
-def load_wordlist(filepath: str) -> list[str]:
-   path = Path(filepath)
-   if not path.is_file():
-      raise FileNotFoundError(f"Wordlist not found: {filepath}")
-
-   words: list[str] = []
-   skipped = 0
-   with open(path, "r", encoding="utf-8") as fh:
-      for line in fh:
-         if not line.strip() or line.lstrip().startswith("#"):
-            continue
-         word = _clean_word(line)
-         if _is_valid_tagalog_word(word):
-            words.append(word)
-         else:
-            skipped += 1
-
-   if not words:
+def _balanced_sample_plan(num_samples: int) -> list[tuple[list[list[str]], str, str]]:
+   """Plan random text whose Baybayin Unicode codepoints have equal totals."""
+   if num_samples < 2:
       raise ValueError(
-         f"No valid words found in '{filepath}'.  "
-         "Check WORD_MIN_LEN / WORD_MAX_LEN or the file contents."
+         "Balanced generation needs at least 2 samples to include every "
+         "Baybayin codepoint and punctuation mark equally."
       )
 
-   seen: set[str] = set()
-   unique: list[str] = []
-   for w in words:
-      if w not in seen:
-         seen.add(w)
-         unique.append(w)
+   # Each of the 23 Baybayin codepoints, including punctuation, occurs C times.
+   # Aim for about 3.5 Baybayin glyphs per sample instead of minimizing text length.
+   codepoint_count = (7 * num_samples + 35) // 36
+   total_glyphs = 18 * codepoint_count
+   extra_glyphs = total_glyphs - 2 * num_samples
 
-   log.info(
-      "Loaded %d unique words from '%s'  (skipped %d invalid entries)",
-      len(unique), filepath, skipped,
-   )
-   return unique
+   # Spread the extra glyphs evenly, so samples have similar text lengths.
+   base_increment, remainder = divmod(extra_glyphs, num_samples)
+   sample_increments = [base_increment] * (num_samples - remainder)
+   sample_increments.extend([base_increment + 1] * remainder)
+   random.shuffle(sample_increments)
+   sample_lengths = [2 + increment for increment in sample_increments]
+
+   counts: dict[str, int] = {"a": codepoint_count, "e_i": codepoint_count, "o_u": codepoint_count}
+   marked_counts = [[0, 0, 0] for _ in _BALANCE_CONSONANTS]
+   for mark_index in range(3):
+      remaining = codepoint_count
+      family_index = mark_index
+      while remaining:
+         if sum(marked_counts[family_index]) < codepoint_count:
+            marked_counts[family_index][mark_index] += 1
+            remaining -= 1
+         family_index = (family_index + 1) % len(_BALANCE_CONSONANTS)
+
+   for consonant, marks in zip(_BALANCE_CONSONANTS, marked_counts):
+      counts[_get_folder(consonant, "a")] = codepoint_count - sum(marks)
+      counts[_get_folder(consonant, "e")] = marks[0]
+      counts[_get_folder(consonant, "o")] = marks[1]
+      counts[consonant] = marks[2]
+
+   glyph_pool = [folder for folder, count in counts.items() for _ in range(count)]
+   random.shuffle(glyph_pool)
+
+   punctuation_pool = [","] * codepoint_count + ["."] * codepoint_count
+   punctuation_pool.extend([""] * (num_samples - len(punctuation_pool)))
+   random.shuffle(punctuation_pool)
+
+   plan: list[tuple[list[list[str]], str, str]] = []
+   pool_offset = 0
+   for glyph_count in sample_lengths:
+      glyphs = glyph_pool[pool_offset:pool_offset + glyph_count]
+      pool_offset += glyph_count
+      possible_word_lengths = [
+         lengths
+         for word_count in range(1, MAX_WORDS_PER_SAMPLE + 1)
+         for lengths in itertools.product(
+            range(MIN_SYLLABLES_PER_WORD, MAX_SYLLABLES_PER_WORD + 1),
+            repeat=word_count,
+         )
+         if sum(lengths) == glyph_count
+      ]
+      word_lengths = random.choice(possible_word_lengths)
+      words: list[list[str]] = []
+      offset = 0
+      for word_length in word_lengths:
+         words.append(glyphs[offset:offset + word_length])
+         offset += word_length
+
+      label = " ".join("".join(FOLDER_TO_UNICODE[folder] for folder in word) for word in words)
+      punctuation = punctuation_pool[len(plan)]
+      punctuation_label = {",": COMMA_LABEL, ".": DOT_LABEL, "": ""}[punctuation]
+      plan.append((words, label + punctuation_label, punctuation))
+
+   return plan
 
 def _get_folder(consonant: Optional[str], vowel: Optional[str]) -> Optional[str]:
    if consonant is None:
@@ -301,7 +333,7 @@ def build_svg_library(baybayin_dir: str) -> dict[str, list[str]]:
       if not folder.is_dir():
          continue
       name = folder.name
-      if name not in FOLDER_TO_UNICODE:
+      if name not in FOLDER_TO_UNICODE and name not in {"comma", "dot"}:
          log.warning("Skipping unknown Baybayin folder: '%s'", name)
          continue
       svgs = sorted(folder.glob("*.svg"))
@@ -546,6 +578,52 @@ def render_word_image(
       if idx < len(gaps):
          x += gaps[idx]
 
+   return canvas
+
+def render_random_text_svg(
+   words: list[list[str]],
+   punctuation: str,
+   svg_library: dict[str, list[str]],
+   target_height: int,
+) -> Optional[Image.Image]:
+   """Render random words and punctuation from SVG assets with explicit spaces."""
+   word_images = []
+   for word_folders in words:
+      img = render_word_image(word_folders, svg_library, target_height)
+      if img is None:
+         return None
+      word_images.append(img)
+
+   if not word_images:
+      return None
+
+   space_width = target_height
+   punctuation_img = None
+   if punctuation:
+      punctuation_folder = "comma" if punctuation == "," else "dot"
+      punctuation_paths = svg_library.get(punctuation_folder, [])
+      if punctuation_paths:
+         punctuation_img = load_svg_character(
+            random.choice(punctuation_paths), target_height
+         )
+         bbox = punctuation_img.getchannel("A").getbbox()
+         if bbox:
+            punctuation_img = punctuation_img.crop(bbox)
+      if punctuation_img is None:
+         return None
+   punctuation_width = punctuation_img.width if punctuation_img else 0
+   height = max(img.height for img in word_images)
+   width = sum(img.width for img in word_images) + space_width * (len(word_images) - 1) + punctuation_width
+   canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+   x = 0
+   for index, img in enumerate(word_images):
+      canvas.alpha_composite(img, (x, (height - img.height) // 2))
+      x += img.width
+      if index < len(word_images) - 1:
+         x += space_width
+
+   if punctuation_img:
+      canvas.alpha_composite(punctuation_img, (x, height - punctuation_img.height))
    return canvas
 
 def _pad_or_crop_to(img: Image.Image, w: int, h: int) -> Image.Image:
@@ -972,7 +1050,6 @@ def generate_dataset(
    target_height: int    = TARGET_HEIGHT,
    baybayin_dir: str     = BAYBAYIN_DIR,
    backgrounds_dir: str  = BACKGROUNDS_DIR,
-   wordlist_file: str    = WORDLIST_FILE,
    output_dir: str       = OUTPUT_DIR,
    grayscale: bool       = GRAYSCALE_OUTPUT,
    seed: Optional[int]   = RANDOM_SEED,
@@ -985,66 +1062,37 @@ def generate_dataset(
       random.seed(seed)
       np.random.seed(seed)
 
-   font_prob = min(1.0, max(0.0, font_prob))
+   sample_plan = _balanced_sample_plan(num_samples)
    augment_prob = min(1.0, max(0.0, augment_prob))
+   font_prob = min(1.0, max(0.0, font_prob))
 
    out_root   = Path(output_dir)
    images_dir = out_root / IMAGES_SUBDIR
    images_dir.mkdir(parents=True, exist_ok=True)
    labels_path = out_root / LABELS_FILE
 
-   words    = load_wordlist(wordlist_file)
-   svg_lib  = build_svg_library(baybayin_dir)
+   svg_lib = build_svg_library(baybayin_dir)
    bg_paths = load_background_paths(backgrounds_dir)
 
-   # Validate font path when font rendering is enabled
-   use_font = font_prob > 0.0
-   if use_font:
+   if font_prob > 0:
       font_path_obj = Path(font_path)
       if not font_path_obj.is_file():
-         log.warning(
-            "Noto Sans Tagalog font not found at '%s'. "
-            "Font rendering disabled (font_prob forced to 0).",
-            font_path,
-         )
-         use_font  = False
-         font_prob = 0.0
+         raise FileNotFoundError(f"Baybayin font not found: {font_path}")
+      log.info("Font rendering enabled  (prob=%.0f%%)  font: %s", font_prob * 100, font_path)
+   if font_prob < 1 and not _svg_rendering_available():
+      if Path(font_path).is_file():
+         log.warning("CairoSVG/native Cairo unavailable; using font rendering for all samples")
+         font_prob = 1.0
       else:
-         log.info("Font rendering enabled  (prob=%.0f%%)  font: %s", font_prob * 100, font_path)
-
+         raise RuntimeError("SVG rendering requires CairoSVG and native Cairo; no font fallback is available.")
+   if font_prob < 1:
+      log.info("SVG rendering enabled for Baybayin character assets")
    log.info("Augmentation enabled  (prob=%.0f%%)", augment_prob * 100)
 
-   svg_enabled = font_prob < 1.0
-   if svg_enabled and not _svg_rendering_available():
-      if use_font:
-         log.warning(
-            "CairoSVG/native Cairo is unavailable. SVG rendering disabled; "
-            "forcing font-only generation."
-         )
-         font_prob = 1.0
-         svg_enabled = False
-      else:
-         raise RuntimeError(
-            "SVG rendering requires cairosvg plus the native Cairo library, "
-            "and font rendering is disabled."
-         )
-
-   log.info("Pre-checking %d words for translatability …", len(words))
-   valid: list[tuple[str, list[str], str]] = []
-   for w in words:
-      folders, ustr = transliterate_to_baybayin(w)
-
-      has_svg  = svg_enabled and folders and ustr and all(f in svg_lib for f in folders)
-      has_font = use_font and bool(ustr)
-      if has_svg or has_font:
-         valid.append((w, folders, ustr))
-
-   if not valid:
-      raise ValueError(
-         "No words could be transliterated AND rendered.  "
-         "Check your wordlist, SVG folder names, and FOLDER_TO_UNICODE mapping."
-      )
-   log.info("%d / %d words are renderable", len(valid), len(words))
+   log.info(
+      "Generating balanced text: each Baybayin codepoint and punctuation mark appears %d times",
+      (num_samples + 8) // 9,
+   )
 
    failures = 0
    generated = 0
@@ -1060,9 +1108,12 @@ def generate_dataset(
       workers = max(1, (os.cpu_count() or 1))
    workers = max(1, int(workers))
 
-   def _generate_one_until_ok(task_idx: int) -> tuple[int, Optional[tuple[Image.Image, str]]]:
+   def _generate_one_until_ok(
+      task_idx: int,
+      retry_round: int = 0,
+   ) -> tuple[int, Optional[tuple[Image.Image, str]]]:
       try:
-         base_local = 0 if seed is None else (seed + 10_000_000 + task_idx)
+         base_local = 0 if seed is None else (seed + 10_000_000 + task_idx + retry_round * 200)
 
          # Try multiple times inside the worker to reduce wasted capacity.
          # (Acceptance rate can be low due to quality gating.)
@@ -1072,22 +1123,15 @@ def generate_dataset(
                random.seed(local_seed)
                np.random.seed(local_seed % (2**32 - 1))
 
-            word, folders, unicode_label = random.choice(valid)
-
-            # Choose rendering source: font or SVG
-            has_svg = svg_enabled and all(f in svg_lib for f in folders)
-            use_font_this_sample = (
-               use_font
-               and bool(unicode_label)         # has a valid Unicode string
-               and (not has_svg or random.random() < font_prob)
-            )
-
-            if use_font_this_sample:
+            word_folders, unicode_label, punctuation = sample_plan[task_idx]
+            if font_prob > 0 and random.random() < font_prob:
                text_img = render_word_image_font(
                   unicode_label, target_height, font_path=font_path
                )
             else:
-               text_img = render_word_image(folders, svg_lib, target_height)
+               text_img = render_random_text_svg(
+                  word_folders, punctuation, svg_lib, target_height
+               )
 
             if text_img is None:
                continue
@@ -1134,6 +1178,7 @@ def generate_dataset(
 
          # Save accepted samples in submission order by tracking the next task index.
          accepted_buffer: dict[int, tuple[Image.Image, str]] = {}
+         retry_rounds: dict[int, int] = {}
          next_to_save = 0
 
          while generated < num_samples:
@@ -1147,6 +1192,14 @@ def generate_dataset(
                result_task_idx, result = fut.result()
                if result is None:
                   failures += 1
+                  # Retry the same planned sample so the balanced label plan
+                  # remains aligned with task indices.
+                  retry_rounds[result_task_idx] = retry_rounds.get(result_task_idx, 0) + 1
+                  futures.append(ex.submit(
+                     _generate_one_until_ok,
+                     result_task_idx,
+                     retry_rounds[result_task_idx],
+                  ))
                else:
                   accepted_buffer[result_task_idx] = result
 
@@ -1179,7 +1232,7 @@ def generate_dataset(
                   )
 
                # Maintain in-flight window.
-               while len(futures) < in_flight_target and generated + len(futures) < num_samples:
+               while len(futures) < in_flight_target and task_counter < num_samples:
                   _submit_one()
 
    print()
@@ -1194,7 +1247,7 @@ def _build_parser() -> argparse.ArgumentParser:
       prog="generate.py",
       description=(
          "Baybayin Synthetic OCR Dataset Generator\n"
-         "Generates PNG images of Baybayin words with Baybayin Unicode labels."
+         "Generates PNG images of random Baybayin text with Unicode labels."
       ),
       formatter_class=argparse.RawDescriptionHelpFormatter,
    )
@@ -1219,11 +1272,6 @@ def _build_parser() -> argparse.ArgumentParser:
       help=f"Directory with background images (default: '{BACKGROUNDS_DIR}')",
    )
    p.add_argument(
-      "--wordlist",
-      type=str, default=WORDLIST_FILE, metavar="FILE",
-      help=f"Path to word list file (default: '{WORDLIST_FILE}')",
-   )
-   p.add_argument(
       "--output-dir", "-o",
       type=str, default=OUTPUT_DIR, metavar="DIR",
       help=f"Root output directory (default: '{OUTPUT_DIR}')",
@@ -1246,11 +1294,7 @@ def _build_parser() -> argparse.ArgumentParser:
    p.add_argument(
       "--font-prob",
       type=float, default=FONT_RENDER_PROB, metavar="PROB",
-      help=(
-         f"Probability [0.0-1.0] of rendering each sample with the Noto Sans "
-         f"Tagalog TTF font instead of SVGs (default: {FONT_RENDER_PROB}). "
-         "Set to 0 to use only SVGs, 1 to use only the font."
-      ),
+      help=f"Probability [0.0-1.0] of using the Noto Tagalog font instead of SVGs (default: {FONT_RENDER_PROB}).",
    )
    p.add_argument(
       "--font-path",
@@ -1300,7 +1344,6 @@ def main() -> None:
       target_height   = args.height,
       baybayin_dir    = args.baybayin_dir,
       backgrounds_dir = args.backgrounds_dir,
-      wordlist_file   = args.wordlist,
       output_dir      = args.output_dir,
       grayscale       = args.grayscale,
       seed            = args.seed,
